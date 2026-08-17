@@ -1,5 +1,3 @@
-// benches/ordex_bench.rs
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ordex::prelude::*;
 
@@ -70,9 +68,9 @@ fn bench_alignment_comparison(c: &mut Criterion) {
     let verified = VerifiedIndices::new(indices.clone());
     c.bench_function("ordex_dynamic_16", |b| {
         b.iter(|| {
-            arena.ordex(&verified, |iter| {
+            arena.ordex(&verified, |mut iter| {
                 let mut sum = 0;
-                for val in iter {
+                while let Some(val) = iter.next() {
                     sum += *val;
                     *val = black_box(sum);
                 }

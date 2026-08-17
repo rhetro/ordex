@@ -1,5 +1,3 @@
-// tests/scenario_systems.rs
-
 //! Ordex (OrdexArena) Practical Use Case: Systems Programming
 //!
 //! This scenario demonstrates how to utilize Ordex in real-world, system-level

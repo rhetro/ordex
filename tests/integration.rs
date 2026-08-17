@@ -1,5 +1,3 @@
-// tests/integration.rs
-
 use ordex::prelude::*;
 
 // =====================================================================
@@ -146,7 +144,7 @@ mod tests {
             "Success"
         });
 
-        assert_eq!(result, Some("Success"));
+        assert_eq!(result, "Success");
         assert_eq!(arena.get(i0).unwrap().power, 11.0);
         assert_eq!(arena.get(i1).unwrap().power, 22.0);
         assert_eq!(arena.get(i2).unwrap().power, 33.0);

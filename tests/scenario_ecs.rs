@@ -1,5 +1,3 @@
-// tests/scenario_ecs.rs
-
 //! Ordex (OrdexArena) Practical Use Case: ECS Combat System
 //!
 //! This scenario demonstrates how to use Ordex as a backend for an Entity

@@ -1,5 +1,3 @@
-// src/prelude.rs
-
 //! The Ordex Prelude
 //!
 //! The purpose of this module is to alleviate imports of commonly-used

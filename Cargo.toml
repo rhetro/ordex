@@ -1,9 +1,9 @@
 [package]
 name = "ordex"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Rhetro <rhetro@rhetroxc.com>"]
-description = "A strict generational arena with static/dynamic multi-mutable access, optimized for zero-allocation safety validation and cache-friendly layout."
+description = "A strict generational arena with static/dynamic multi-mutable access, optimized for amortized zero-allocation safety validation and cache-friendly layout."
 repository = "https://github.com/rhetro/ordex"
 license = "MIT OR Apache-2.0"
 keywords = ["arena", "allocator", "ecs", "generational", "aliasing"]
@@ -12,8 +12,6 @@ readme = "README.md"
 
 [dev-dependencies]
 criterion = "0.5"
-ratatui = "0.26.2"
-crossterm = "0.27.0"
 rand = "0.8.5"
 
 [features]
@@ -26,6 +24,18 @@ harness = false
 
 [[bench]]
 name = "ordex_extreme"
+harness = false
+
+[[bench]]
+name = "ordex_align_limit"
+harness = false
+
+[[bench]]
+name = "ordex_dynamic_limit"
+harness = false
+
+[[bench]]
+name = "ordex_freelist_limit"
 harness = false
 
 [profile.release]

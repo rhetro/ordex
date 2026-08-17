@@ -1,6 +1,4 @@
-// src/core.rs
-
-use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 
 #[cfg(not(feature = "large-indices"))]
 pub type IndexType = u32;
@@ -34,202 +32,285 @@ pub enum Entry<T> {
 }
 
 pub struct OrdexArena<T> {
-    data: Vec<Entry<T>>,
-    free_head: Option<IndexType>,
+    pub(crate) data: Vec<Entry<T>>,
+    pub(crate) free_head: Option<IndexType>,
 }
 
 // =====================================================================
-// 2. Macros (Static Expansion & Ergonomics)
+// 2. Inner Workspace (v0.2.0 Mid SoA Architecture)
 // =====================================================================
 
-macro_rules! impl_align {
-    ($fn_name:ident $(, $idx:ident : $t:ty)+) => {
-        #[inline(always)]
-        pub fn $fn_name<F, R>(&mut self $(, $idx: Index)+, f: F) -> R
-        where
-            F: FnOnce($(&mut $t),+) -> R,
-        {
-            let __ordex_len = self.data.len();
+#[repr(C, align(64))]
+struct ChunkData {
+    indices: [MaybeUninit<Index>; 16],
+}
 
-            $(
-                let __ordex_idx_usize = usize::try_from($idx.index)
-                    .expect("Index is too large for the target architecture memory size");
-                assert!(
-                    __ordex_idx_usize < __ordex_len,
-                    "Index out of bounds: index {} is out of arena capacity. If its existence is uncertain, use `get()` or `get_mut()` instead of `align!`.",
-                    __ordex_idx_usize
-                );
-                match &self.data[__ordex_idx_usize] {
-                    Entry::Occupied { generation, .. } => {
-                        assert_eq!(
-                            *generation,
-                            $idx.generation,
-                            "Generation mismatch at index {}: This element has already been removed or replaced. If its existence is uncertain, use `get()` or `get_mut()` instead of `align!`.",
-                            __ordex_idx_usize
-                        );
-                    }
-                    Entry::Free { .. } => panic!(
-                        "Dangling pointer: Entry at index {} is already freed. If its existence is uncertain, use `get()` or `get_mut()` instead of `align!`.",
-                        __ordex_idx_usize
-                    ),
-                }
-            )+
+impl Default for ChunkData {
+    #[inline(always)]
+    fn default() -> Self {
+        Self {
+            indices: [const { MaybeUninit::uninit() }; 16],
+        }
+    }
+}
 
-            let __ordex_indices = [ $($idx.index),+ ];
-            let __ordex_len = __ordex_indices.len();
-            for i in 0..__ordex_len {
-                for j in (i + 1)..__ordex_len {
-                    assert!(
-                        __ordex_indices[i] != __ordex_indices[j],
-                        "Aliasing detected: Multiple mutable references requested for the same index."
-                    );
-                }
-            }
+#[derive(Clone, Copy, Default)]
+struct ChunkMeta {
+    bitmap: u16,
+    occupancy: u8,
+    is_dirty: bool,
+}
 
+struct Workspace {
+    metas: Vec<ChunkMeta>,
+    chunks: Vec<ChunkData>,
+    overflow: Vec<(usize, MaybeUninit<Index>)>,
+}
 
-            unsafe {
-                let __ordex_ptr = self.data.as_mut_ptr();
-                f($(
-                    match &mut *__ordex_ptr.add(usize::try_from($idx.index).unwrap_unchecked()) {
-                        Entry::Occupied { value, .. } => value,
-                        _ => core::hint::unreachable_unchecked(),
-                    }
-                ),+)
+impl Workspace {
+    fn new() -> Self {
+        Self {
+            metas: Vec::new(),
+            chunks: Vec::new(),
+            overflow: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn prepare(&mut self, c: usize) {
+        self.metas.clear();
+        self.metas.resize(c, ChunkMeta::default());
+        self.chunks.clear();
+        self.chunks.resize_with(c, ChunkData::default);
+        self.overflow.clear();
+    }
+}
+
+#[inline(always)]
+fn sort_overflow(overflow: &mut [(usize, MaybeUninit<Index>)]) {
+    let len = overflow.len();
+    if len <= 1 {
+        return;
+    }
+
+    for i in 1..len {
+        let mut j = i;
+        while j > 0 {
+            let key_a = overflow[j - 1].0;
+            let key_b = overflow[j].0;
+            let idx_a = unsafe { overflow[j - 1].1.assume_init().index };
+            let idx_b = unsafe { overflow[j].1.assume_init().index };
+
+            if key_a > key_b || (key_a == key_b && idx_a > idx_b) {
+                overflow.swap(j - 1, j);
+                j -= 1;
+            } else {
+                break;
             }
         }
-    };
-}
-
-#[macro_export]
-macro_rules! align {
-    ($arena:expr, $i0:expr, $i1:expr, $closure:expr) => {
-        $arena.align2($i0, $i1, $closure)
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $closure:expr) => {
-        $arena.align3($i0, $i1, $i2, $closure)
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $closure:expr) => {
-        $arena.align4($i0, $i1, $i2, $i3, $closure)
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $closure:expr) => {
-        $arena.align5($i0, $i1, $i2, $i3, $i4, $closure)
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $closure:expr) => {
-        $arena.align6($i0, $i1, $i2, $i3, $i4, $i5, $closure)
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $closure:expr) => {
-        $arena.align7($i0, $i1, $i2, $i3, $i4, $i5, $i6, $closure)
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $i7:expr, $closure:expr) => {
-        $arena.align8($i0, $i1, $i2, $i3, $i4, $i5, $i6, $i7, $closure)
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $i7:expr, $i8:expr, $closure:expr) => {
-        $arena.align9($i0, $i1, $i2, $i3, $i4, $i5, $i6, $i7, $i8, $closure)
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $i7:expr, $i8:expr, $i9:expr, $closure:expr) => {
-        $arena.align10($i0, $i1, $i2, $i3, $i4, $i5, $i6, $i7, $i8, $i9, $closure)
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $i7:expr, $i8:expr, $i9:expr, $i10:expr, $closure:expr) => {
-        $arena.align11(
-            $i0, $i1, $i2, $i3, $i4, $i5, $i6, $i7, $i8, $i9, $i10, $closure,
-        )
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $i7:expr, $i8:expr, $i9:expr, $i10:expr, $i11:expr, $closure:expr) => {
-        $arena.align12(
-            $i0, $i1, $i2, $i3, $i4, $i5, $i6, $i7, $i8, $i9, $i10, $i11, $closure,
-        )
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $i7:expr, $i8:expr, $i9:expr, $i10:expr, $i11:expr, $i12:expr, $closure:expr) => {
-        $arena.align13(
-            $i0, $i1, $i2, $i3, $i4, $i5, $i6, $i7, $i8, $i9, $i10, $i11, $i12, $closure,
-        )
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $i7:expr, $i8:expr, $i9:expr, $i10:expr, $i11:expr, $i12:expr, $i13:expr, $closure:expr) => {
-        $arena.align14(
-            $i0, $i1, $i2, $i3, $i4, $i5, $i6, $i7, $i8, $i9, $i10, $i11, $i12, $i13, $closure,
-        )
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $i7:expr, $i8:expr, $i9:expr, $i10:expr, $i11:expr, $i12:expr, $i13:expr, $i14:expr, $closure:expr) => {
-        $arena.align15(
-            $i0, $i1, $i2, $i3, $i4, $i5, $i6, $i7, $i8, $i9, $i10, $i11, $i12, $i13, $i14, $closure,
-        )
-    };
-    ($arena:expr, $i0:expr, $i1:expr, $i2:expr, $i3:expr, $i4:expr, $i5:expr, $i6:expr, $i7:expr, $i8:expr, $i9:expr, $i10:expr, $i11:expr, $i12:expr, $i13:expr, $i14:expr, $i15:expr, $closure:expr) => {
-        $arena.align16(
-            $i0, $i1, $i2, $i3, $i4, $i5, $i6, $i7, $i8, $i9, $i10, $i11, $i12, $i13, $i14, $i15, $closure,
-        )
-    };
-    ($arena:expr, $($idx:expr),+ $(,)?) => {
-        compile_error!("align! macro supports up to 16 indices for optimal register and I-cache usage. For 17 or more elements, use OrdexArena::ordex() to maintain performance and order.");
-    };
+    }
 }
 
 // =====================================================================
-// 3. Dynamic Expansion Components
+// 3. Dynamic Expansion Components (VerifiedIndices)
 // =====================================================================
 
 pub struct VerifiedIndices {
-    indices: Vec<Index>,
+    pub(crate) ordered: Vec<Index>,
+    ws: Workspace,
 }
 
 impl VerifiedIndices {
-    pub fn new(mut raw_indices: Vec<Index>) -> Self {
-        raw_indices.sort_unstable_by_key(|idx| idx.index);
-        for i in 1..raw_indices.len() {
-            assert!(
-                raw_indices[i - 1].index != raw_indices[i].index,
-                "Aliasing detected: Multiple mutable references to the same physical index"
-            );
+    pub fn new(indices: Vec<Index>) -> Self {
+        let n = indices.len();
+        if n == 0 {
+            return Self {
+                ordered: Vec::new(),
+                ws: Workspace::new(),
+            };
         }
-        Self {
-            indices: raw_indices,
+
+        let min_key = indices.iter().map(|idx| idx.index as u64).min().unwrap();
+        let max_key = indices.iter().map(|idx| idx.index as u64).max().unwrap();
+        let range = max_key.saturating_sub(min_key);
+
+        let c = std::cmp::max(1, n / 4);
+        let m = (c * 16 - 1) as u64;
+        let multiplier = if range == 0 {
+            0
+        } else {
+            (((m as u128) << 32) / (range as u128)) as u64
+        };
+
+        let mut ws = Workspace::new();
+        ws.prepare(c);
+
+        let ordered = Self::build_from_indices(&indices, c, min_key, multiplier, &mut ws);
+
+        Self { ordered, ws }
+    }
+
+    fn build_from_indices(
+        indices: &[Index],
+        c: usize,
+        min_key: u64,
+        multiplier: u64,
+        ws: &mut Workspace,
+    ) -> Vec<Index> {
+        let n = indices.len();
+        let metas = &mut ws.metas;
+        let chunks = &mut ws.chunks;
+        let overflow = &mut ws.overflow;
+
+        for &idx in indices {
+            let key = idx.index as u64;
+            let diff = key - min_key;
+            let i_v = ((diff as u128 * multiplier as u128) >> 32) as usize;
+
+            let chunk_id = std::cmp::min(i_v >> 4, c - 1);
+            let offset = i_v & 15;
+
+            let meta = &mut metas[chunk_id];
+            let data_chunk = &mut chunks[chunk_id];
+
+            let bit = 1 << offset;
+            if (meta.bitmap & bit) != 0 {
+                let existing = unsafe { data_chunk.indices[offset].assume_init() };
+
+                if existing.index == idx.index && existing.generation == idx.generation {
+                    panic!(
+                        "Aliasing detected: multiple mutable references requested for index {}.",
+                        idx.index
+                    );
+                } else {
+                    meta.is_dirty = true;
+                    let empty_offset = (!meta.bitmap).trailing_zeros() as usize;
+
+                    if empty_offset < 16 {
+                        data_chunk.indices[empty_offset].write(idx);
+                        meta.bitmap |= 1 << empty_offset;
+                        meta.occupancy += 1;
+                    } else {
+                        overflow.push((chunk_id, MaybeUninit::new(idx)));
+                        meta.occupancy += 1;
+                    }
+                }
+            } else {
+                data_chunk.indices[offset].write(idx);
+                meta.bitmap |= bit;
+                meta.occupancy += 1;
+            }
         }
+
+        if overflow.len() > 1 {
+            sort_overflow(overflow);
+        }
+
+        let mut ordered = Vec::with_capacity(n);
+        let mut overflow_idx = 0;
+
+        for id in 0..c {
+            let meta = metas[id];
+            if meta.occupancy == 0
+                && (overflow_idx >= overflow.len() || overflow[overflow_idx].0 != id)
+            {
+                continue;
+            }
+
+            let data_chunk = &chunks[id];
+            let mut bmp = meta.bitmap;
+
+            while bmp != 0 {
+                let offset = bmp.trailing_zeros() as usize;
+                let idx = unsafe { data_chunk.indices[offset].assume_init() };
+                ordered.push(idx);
+                bmp &= !(1 << offset);
+            }
+
+            while overflow_idx < overflow.len() && overflow[overflow_idx].0 == id {
+                let idx = unsafe { overflow[overflow_idx].1.assume_init() };
+                ordered.push(idx);
+                overflow_idx += 1;
+            }
+        }
+
+        ordered
     }
 
     pub fn clear_and_verify(&mut self, new_targets: &[Index]) {
-        self.indices.clear();
-        self.indices.extend_from_slice(new_targets);
-        self.indices.sort_unstable_by_key(|idx| idx.index);
-        for i in 1..self.indices.len() {
-            assert!(
-                self.indices[i - 1].index != self.indices[i].index,
-                "Aliasing detected: Multiple mutable references to the same physical index"
-            );
+        self.ordered.clear();
+
+        if new_targets.is_empty() {
+            return;
         }
+
+        let n = new_targets.len();
+        if n == 1 {
+            self.ordered.extend_from_slice(new_targets);
+            return;
+        }
+
+        let min_key = new_targets
+            .iter()
+            .map(|idx| idx.index as u64)
+            .min()
+            .unwrap();
+        let max_key = new_targets
+            .iter()
+            .map(|idx| idx.index as u64)
+            .max()
+            .unwrap();
+        let range = max_key.saturating_sub(min_key);
+
+        let c = std::cmp::max(1, n / 4);
+        let m = (c * 16 - 1) as u64;
+        let multiplier = if range == 0 {
+            0
+        } else {
+            (((m as u128) << 32) / (range as u128)) as u64
+        };
+
+        self.ws.prepare(c);
+
+        self.ordered = Self::build_from_indices(new_targets, c, min_key, multiplier, &mut self.ws);
     }
 
     pub fn as_slice(&self) -> &[Index] {
-        &self.indices
+        &self.ordered
     }
 }
 
-pub struct OrdexArenaIter<'a, T> {
-    ptr: *mut Entry<T>,
-    indices: std::slice::Iter<'a, Index>,
-    _marker: PhantomData<&'a mut T>,
+// =====================================================================
+// 4. Core OrdexArena Implementation & OrdexIter
+// =====================================================================
+
+pub struct OrdexIter<'a, T> {
+    arena_ptr: *mut Entry<T>,
+    ordered: &'a [Index],
+    pos: usize,
 }
 
-impl<'a, T> Iterator for OrdexArenaIter<'a, T> {
-    type Item = &'a mut T;
-
+impl<'a, T> OrdexIter<'a, T> {
     #[inline(always)]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.indices.next().map(|idx| unsafe {
-            let idx_usize = usize::try_from(idx.index).unwrap_unchecked();
-            match &mut *self.ptr.add(idx_usize) {
-                Entry::Occupied { value, .. } => value,
-                _ => core::hint::unreachable_unchecked(),
+    pub fn next(&mut self) -> Option<&'a mut T> {
+        if self.pos >= self.ordered.len() {
+            return None;
+        }
+        let idx = self.ordered[self.pos];
+        self.pos += 1;
+
+        let i = usize::try_from(idx.index).unwrap();
+        unsafe {
+            match &mut *self.arena_ptr.add(i) {
+                Entry::Occupied { value, .. } => Some(value),
+                Entry::Free { .. } => core::hint::unreachable_unchecked(),
             }
-        })
+        }
     }
 }
-
-// =====================================================================
-// 4. Core OrdexArena Implementation
-// =====================================================================
 
 impl<T> OrdexArena<T> {
-    const START_GENERATION: GenerationType = unsafe { GenerationType::new_unchecked(1) };
+    pub(crate) const START_GENERATION: GenerationType = unsafe { GenerationType::new_unchecked(1) };
 
     pub fn new() -> Self {
         Self {
@@ -314,10 +395,6 @@ impl<T> OrdexArena<T> {
         None
     }
 
-    // ---------------------------------------------------------------------
-    // Full Iteration
-    // ---------------------------------------------------------------------
-
     pub fn iter(&self) -> impl Iterator<Item = (Index, &T)> {
         self.data
             .iter()
@@ -350,10 +427,6 @@ impl<T> OrdexArena<T> {
             })
     }
 
-    // ---------------------------------------------------------------------
-    // Safe Access (Non-panicking)
-    // ---------------------------------------------------------------------
-
     pub fn get(&self, idx: Index) -> Option<&T> {
         let idx_usize = usize::try_from(idx.index).ok()?;
         self.data.get(idx_usize).and_then(|entry| match entry {
@@ -370,70 +443,34 @@ impl<T> OrdexArena<T> {
         })
     }
 
-    // ---------------------------------------------------------------------
-    // Static Expansion Methods (align, up to n=16)
-    // ---------------------------------------------------------------------
-    impl_align!(align2, i0: T, i1: T);
-    impl_align!(align3, i0: T, i1: T, i2: T);
-    impl_align!(align4, i0: T, i1: T, i2: T, i3: T);
-    impl_align!(align5, i0: T, i1: T, i2: T, i3: T, i4: T);
-    impl_align!(align6, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T);
-    impl_align!(align7, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T);
-    impl_align!(align8, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T, i7: T);
-    impl_align!(align9, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T, i7: T, i8: T);
-    impl_align!(align10, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T, i7: T, i8: T, i9: T);
-    impl_align!(align11, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T, i7: T, i8: T, i9: T, i10: T);
-    impl_align!(align12, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T, i7: T, i8: T, i9: T, i10: T, i11: T);
-    impl_align!(align13, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T, i7: T, i8: T, i9: T, i10: T, i11: T, i12: T);
-    impl_align!(align14, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T, i7: T, i8: T, i9: T, i10: T, i11: T, i12: T, i13: T);
-    impl_align!(align15, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T, i7: T, i8: T, i9: T, i10: T, i11: T, i12: T, i13: T, i14: T);
-    impl_align!(align16, i0: T, i1: T, i2: T, i3: T, i4: T, i5: T, i6: T, i7: T, i8: T, i9: T, i10: T, i11: T, i12: T, i13: T, i14: T, i15: T);
-
-    // ---------------------------------------------------------------------
-    // Dynamic Expansion Method (ordex)
-    // ---------------------------------------------------------------------
     #[inline(always)]
-    pub fn ordex<F, R>(&mut self, verified: &VerifiedIndices, f: F) -> Option<R>
+    pub fn ordex<F, R>(&mut self, verified: &VerifiedIndices, f: F) -> R
     where
-        F: for<'a> FnOnce(OrdexArenaIter<'a, T>) -> R,
+        F: FnOnce(OrdexIter<'_, T>) -> R,
     {
-        if verified.indices.is_empty() {
-            return None;
-        }
-
-        if let Some(max_idx) = verified.indices.last() {
-            let max_usize = usize::try_from(max_idx.index)
+        for idx in &verified.ordered {
+            let i = usize::try_from(idx.index)
                 .expect("Index is too large for the target architecture memory size");
-            assert!(
-                max_usize < self.data.len(),
-                "Index out of bounds: index {} is out of arena capacity. If its existence is uncertain, use `get()` or `get_mut()` instead of `ordex`.",
-                max_usize
-            );
-        }
-
-        for idx in &verified.indices {
-            let idx_usize = usize::try_from(idx.index).unwrap();
-            match &self.data[idx_usize] {
-                Entry::Occupied { generation, .. } => {
+            match self.data.get(i) {
+                Some(Entry::Occupied { generation, .. }) => {
                     assert_eq!(
                         *generation, idx.generation,
-                        "Generation mismatch at index {}: This element has already been removed or replaced. If its existence is uncertain, use `get()` or `get_mut()` instead of `ordex`.",
-                        idx_usize
+                        "Generation mismatch at index {}: element has been removed or replaced.",
+                        i
                     );
                 }
-                Entry::Free { .. } => panic!(
-                    "Dangling pointer: Entry at index {} is already freed. If its existence is uncertain, use `get()` or `get_mut()` instead of `ordex`.",
-                    idx_usize
-                ),
+                Some(Entry::Free { .. }) => {
+                    panic!("Dangling pointer: Entry at index {} is already freed.", i)
+                }
+                None => panic!("Index out of bounds: index {} is out of arena capacity.", i),
             }
         }
 
-        let iter = OrdexArenaIter {
-            ptr: self.data.as_mut_ptr(),
-            indices: verified.indices.iter(),
-            _marker: PhantomData,
+        let iter = OrdexIter {
+            arena_ptr: self.data.as_mut_ptr(),
+            ordered: &verified.ordered,
+            pos: 0,
         };
-
-        Some(f(iter))
+        f(iter)
     }
 }
