@@ -11,7 +11,7 @@ When building non-linear architectures or cross-cutting domain logic (e.g., AST 
 Ordex solves this through two distinct mechanical approaches, split explicitly by their usage patterns:
 
 1. **Targeted Alignment (`align!`):** Extracts up to 16 distinct mutable references simultaneously. Verification is done via fixed-size stack arrays. Capped at `N=16`, the `O(N^2)` unrolled stack checks are optimized by LLVM auto-vectorization (SIMD) and CPU out-of-order execution, running in constant CPU cycles with zero heap allocations.
-2. **Hybrid Dynamic Routing (`ordex`):** Provides safe, batch mutable access for dynamically generated target lists beyond `N=16`. Ordex v0.2.0 uses a **hybrid bucket routing engine with an L2-friendly Structure of Arrays (SoA) layout**. It maps indices into fixed chunks via bitwise masks to yield **amortized `O(N)` validation** under uniform index distributions, falling back to sorted overflow handling when heavy collisions occur.
+2. **Hybrid Dynamic Routing (`ordex`):** Provides safe, batch mutable access for dynamically generated target lists beyond `N=16`. Ordex v0.2.1 uses a **hybrid bucket routing engine with an L2-friendly Structure of Arrays (SoA) layout**. It maps indices into fixed chunks via bitwise masks to yield **amortized `O(N)` validation** under uniform index distributions, falling back to sorted overflow handling when heavy collisions occur.
 3. **Strict ABA Prevention:** Uses generational indices to physically block access from stale pointers (dangling indices).
 
 ## The Aliasing Trilemma (Why Ordex?)
@@ -39,7 +39,7 @@ Ordex is designed to minimize abstraction overhead, leaving access latencies bou
 * **Behavior:** The unrolled `O(N^2)` safety checks are effectively overlapped with memory pipeline accesses via CPU out-of-order execution.
 
 **2. Dynamic Batching (`ordex` for N=10,000)**
-* **v0.2.0 Hybrid SoA Engine:** `~289 µs` total (~28 ns per element).
+* **v0.2.1 Hybrid SoA Engine:** `~289 µs` total (~28 ns per element).
 * **Behavior:** Replacing full dynamic comparison sorts with arithmetic bucketing reduces validation overhead for well-distributed inputs while keeping zero heap allocations when reusing buffers.
 
 ## Real-World Application: Wasm Boids Simulation
@@ -55,7 +55,7 @@ To demonstrate Ordex's capability in a highly dynamic environment, a continuous 
 
 ## Comparison
 
-| Feature | `Rc<RefCell<T>>` | Standard Arenas | **Ordex (v0.2.0)** |
+| Feature | `Rc<RefCell<T>>` | Standard Arenas | **Ordex (v0.2.1)** |
 | :--- | :--- | :--- | :--- |
 | **Simultaneous Mutable Access** | Impossible (Runtime Panic) | Limited (usually 1–2 via `get2_mut`) | **Up to 16 (Static) or N (Dynamic)** |
 | **Runtime Checking** | Ref counts & borrow flags | Bounds & generation checks | **Unrolled Stack Checks (`align!`) / SoA Bucketing (`ordex`)** |
@@ -68,7 +68,7 @@ Add Ordex to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ordex = "0.2.0"
+ordex = "0.2.1"
 ```
 
 ### Basic Usage: Targeted Alignment

@@ -1,6 +1,6 @@
 [package]
 name = "ordex"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Rhetro <rhetro@rhetroxc.com>"]
 description = "A strict generational arena with static/dynamic multi-mutable access, optimized for amortized zero-allocation safety validation and cache-friendly layout."

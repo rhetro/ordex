@@ -145,7 +145,8 @@ impl VerifiedIndices {
         let mut ws = Workspace::new();
         ws.prepare(c);
 
-        let ordered = Self::build_from_indices(&indices, c, min_key, multiplier, &mut ws);
+        let mut ordered = Vec::with_capacity(n);
+        Self::build_from_indices(&indices, c, min_key, multiplier, &mut ws, &mut ordered);
 
         Self { ordered, ws }
     }
@@ -156,8 +157,8 @@ impl VerifiedIndices {
         min_key: u64,
         multiplier: u64,
         ws: &mut Workspace,
-    ) -> Vec<Index> {
-        let n = indices.len();
+        ordered: &mut Vec<Index>,
+    ) {
         let metas = &mut ws.metas;
         let chunks = &mut ws.chunks;
         let overflow = &mut ws.overflow;
@@ -191,7 +192,7 @@ impl VerifiedIndices {
                         meta.bitmap |= 1 << empty_offset;
                         meta.occupancy += 1;
                     } else {
-                        overflow.push((chunk_id, MaybeUninit::new(idx)));
+                        overflow.push((chunk_id, std::mem::MaybeUninit::new(idx)));
                         meta.occupancy += 1;
                     }
                 }
@@ -206,7 +207,6 @@ impl VerifiedIndices {
             sort_overflow(overflow);
         }
 
-        let mut ordered = Vec::with_capacity(n);
         let mut overflow_idx = 0;
 
         for id in 0..c {
@@ -233,8 +233,6 @@ impl VerifiedIndices {
                 overflow_idx += 1;
             }
         }
-
-        ordered
     }
 
     pub fn clear_and_verify(&mut self, new_targets: &[Index]) {
@@ -272,7 +270,14 @@ impl VerifiedIndices {
 
         self.ws.prepare(c);
 
-        self.ordered = Self::build_from_indices(new_targets, c, min_key, multiplier, &mut self.ws);
+        Self::build_from_indices(
+            new_targets,
+            c,
+            min_key,
+            multiplier,
+            &mut self.ws,
+            &mut self.ordered,
+        );
     }
 
     pub fn as_slice(&self) -> &[Index] {
