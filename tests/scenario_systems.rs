@@ -80,8 +80,8 @@ fn scenario_network_multicast() {
     let verified_route = VerifiedIndices::new(target_connections);
 
     // Multicast the payload safely to the exact subset using ordex.
-    router.ordex(&verified_route, |mut iter| {
-        while let Some(session) = iter.next() {
+    router.ordex(&verified_route, |iter| {
+        for session in iter {
             session.outbox.push("Warning: System Rebooting".to_string());
         }
     });

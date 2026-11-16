@@ -2,6 +2,7 @@ use crate::core::{Entry, Index, OrdexArena};
 
 macro_rules! impl_align {
     ($fn_name:ident $(, $idx:ident : $t:ty)+) => {
+        #[allow(clippy::too_many_arguments)]
         #[inline(always)]
         pub fn $fn_name<F, R>(&mut self $(, $idx: Index)+, f: F) -> R
         where

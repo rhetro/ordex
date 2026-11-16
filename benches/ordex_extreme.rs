@@ -81,8 +81,8 @@ fn bench_ordex_extreme(c: &mut Criterion) {
             },
             |sample_handles| {
                 let verified = VerifiedIndices::new(sample_handles);
-                arena.ordex(&verified, |mut iter| {
-                    while let Some(item) = iter.next() {
+                arena.ordex(&verified, |iter| {
+                    for item in iter {
                         black_box(item);
                     }
                 });

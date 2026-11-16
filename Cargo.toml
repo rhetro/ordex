@@ -1,6 +1,6 @@
 [package]
 name = "ordex"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Rhetro <rhetro@rhetroxc.com>"]
 description = "A strict generational arena with static/dynamic multi-mutable access, optimized for amortized zero-allocation safety validation and cache-friendly layout."
@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 keywords = ["arena", "allocator", "ecs", "generational", "aliasing"]
 categories = ["memory-management", "data-structures"]
 readme = "README.md"
+
+[dependencies]
+arsort = "0.1.0"
 
 [dev-dependencies]
 criterion = "0.5"

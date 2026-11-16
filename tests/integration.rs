@@ -212,7 +212,12 @@ mod tests {
         use ordex::prelude::*;
         use std::mem::size_of;
 
-        assert_eq!(size_of::<Index>(), 8);
-        assert_eq!(size_of::<Option<Index>>(), 8);
+        #[cfg(not(feature = "large-indices"))]
+        let expected_size = 8;
+        #[cfg(feature = "large-indices")]
+        let expected_size = 16;
+
+        assert_eq!(size_of::<Index>(), expected_size);
+        assert_eq!(size_of::<Option<Index>>(), expected_size);
     }
 }

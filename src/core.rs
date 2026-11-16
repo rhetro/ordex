@@ -1,3 +1,4 @@
+use arsort::prelude::*;
 use std::mem::MaybeUninit;
 
 #[cfg(not(feature = "large-indices"))]
@@ -10,6 +11,11 @@ pub type IndexType = u64;
 #[cfg(feature = "large-indices")]
 pub type GenerationType = std::num::NonZeroU64;
 
+/// Sweet spot threshold of `arsort` (L1/L2 cache-bound domain).
+/// Datasets larger than this threshold undergo a single-pass disjoint scatter
+/// into cache-sized buckets before invoking `arsort`.
+const MACRO_PARTITION_THRESHOLD: usize = 20000;
+
 // =====================================================================
 // 1. Data Structures (Generational Management)
 // =====================================================================
@@ -18,6 +24,13 @@ pub type GenerationType = std::num::NonZeroU64;
 pub struct Index {
     pub index: IndexType,
     pub generation: GenerationType,
+}
+
+impl SortKey for Index {
+    #[inline(always)]
+    fn sort_key(&self) -> u64 {
+        self.index as u64
+    }
 }
 
 pub enum Entry<T> {
@@ -37,77 +50,36 @@ pub struct OrdexArena<T> {
 }
 
 // =====================================================================
-// 2. Inner Workspace (v0.2.0 Mid SoA Architecture)
+// 2. Inner Workspace (v0.3.0 Single-Pass Scatter + Arsort Architecture)
 // =====================================================================
 
-#[repr(C, align(64))]
-struct ChunkData {
-    indices: [MaybeUninit<Index>; 16],
-}
-
-impl Default for ChunkData {
-    #[inline(always)]
-    fn default() -> Self {
-        Self {
-            indices: [const { MaybeUninit::uninit() }; 16],
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct ChunkMeta {
-    bitmap: u16,
-    occupancy: u8,
-    is_dirty: bool,
-}
-
 struct Workspace {
-    metas: Vec<ChunkMeta>,
-    chunks: Vec<ChunkData>,
-    overflow: Vec<(usize, MaybeUninit<Index>)>,
+    buffer: Vec<MaybeUninit<Index>>,
+    counts: Vec<usize>,
+    offsets: Vec<usize>,
 }
 
 impl Workspace {
     fn new() -> Self {
         Self {
-            metas: Vec::new(),
-            chunks: Vec::new(),
-            overflow: Vec::new(),
+            buffer: Vec::new(),
+            counts: Vec::new(),
+            offsets: Vec::new(),
         }
     }
 
     #[inline(always)]
-    fn prepare(&mut self, c: usize) {
-        self.metas.clear();
-        self.metas.resize(c, ChunkMeta::default());
-        self.chunks.clear();
-        self.chunks.resize_with(c, ChunkData::default);
-        self.overflow.clear();
-    }
-}
-
-#[inline(always)]
-fn sort_overflow(overflow: &mut [(usize, MaybeUninit<Index>)]) {
-    let len = overflow.len();
-    if len <= 1 {
-        return;
-    }
-
-    for i in 1..len {
-        let mut j = i;
-        while j > 0 {
-            let key_a = overflow[j - 1].0;
-            let key_b = overflow[j].0;
-            let idx_a = unsafe { overflow[j - 1].1.assume_init().index };
-            let idx_b = unsafe { overflow[j].1.assume_init().index };
-
-            if key_a > key_b || (key_a == key_b && idx_a > idx_b) {
-                overflow.swap(j - 1, j);
-                j -= 1;
-            } else {
-                break;
-            }
+    fn prepare(&mut self, n: usize, num_buckets: usize) {
+        if self.buffer.capacity() < n {
+            self.buffer.reserve(n - self.buffer.len());
         }
+        unsafe {
+            self.buffer.set_len(n);
+        }
+        self.counts.clear();
+        self.counts.resize(num_buckets, 0);
+        self.offsets.clear();
+        self.offsets.resize(num_buckets, 0);
     }
 }
 
@@ -121,117 +93,107 @@ pub struct VerifiedIndices {
 }
 
 impl VerifiedIndices {
-    pub fn new(indices: Vec<Index>) -> Self {
-        let n = indices.len();
-        if n == 0 {
-            return Self {
-                ordered: Vec::new(),
-                ws: Workspace::new(),
-            };
-        }
-
-        let min_key = indices.iter().map(|idx| idx.index as u64).min().unwrap();
-        let max_key = indices.iter().map(|idx| idx.index as u64).max().unwrap();
-        let range = max_key.saturating_sub(min_key);
-
-        let c = std::cmp::max(1, n / 4);
-        let m = (c * 16 - 1) as u64;
-        let multiplier = if range == 0 {
-            0
-        } else {
-            (((m as u128) << 32) / (range as u128)) as u64
-        };
-
+    pub fn new(mut indices: Vec<Index>) -> Self {
         let mut ws = Workspace::new();
-        ws.prepare(c);
-
-        let mut ordered = Vec::with_capacity(n);
-        Self::build_from_indices(&indices, c, min_key, multiplier, &mut ws, &mut ordered);
-
-        Self { ordered, ws }
+        Self::build_from_indices(&mut indices, &mut ws);
+        Self {
+            ordered: indices,
+            ws,
+        }
     }
 
-    fn build_from_indices(
-        indices: &[Index],
-        c: usize,
-        min_key: u64,
-        multiplier: u64,
-        ws: &mut Workspace,
-        ordered: &mut Vec<Index>,
-    ) {
-        let metas = &mut ws.metas;
-        let chunks = &mut ws.chunks;
-        let overflow = &mut ws.overflow;
+    fn build_from_indices(indices: &mut [Index], ws: &mut Workspace) {
+        let n = indices.len();
+        if n <= 1 {
+            return;
+        }
 
-        for &idx in indices {
-            let key = idx.index as u64;
-            let diff = key - min_key;
-            let i_v = ((diff as u128 * multiplier as u128) >> 32) as usize;
+        if n <= MACRO_PARTITION_THRESHOLD {
+            arsort(indices);
+        } else {
+            Self::partition_and_sort_macro(indices, ws);
+        }
 
-            let chunk_id = std::cmp::min(i_v >> 4, c - 1);
-            let offset = i_v & 15;
+        for i in 0..(n - 1) {
+            if indices[i].index == indices[i + 1].index {
+                panic!(
+                    "Aliasing detected: multiple mutable references requested for index {}.",
+                    indices[i].index
+                );
+            }
+        }
+    }
 
-            let meta = &mut metas[chunk_id];
-            let data_chunk = &mut chunks[chunk_id];
+    fn partition_and_sort_macro(indices: &mut [Index], ws: &mut Workspace) {
+        let n = indices.len();
 
-            let bit = 1 << offset;
-            if (meta.bitmap & bit) != 0 {
-                let existing = unsafe { data_chunk.indices[offset].assume_init() };
-
-                if existing.index == idx.index && existing.generation == idx.generation {
-                    panic!(
-                        "Aliasing detected: multiple mutable references requested for index {}.",
-                        idx.index
-                    );
-                } else {
-                    meta.is_dirty = true;
-                    let empty_offset = (!meta.bitmap).trailing_zeros() as usize;
-
-                    if empty_offset < 16 {
-                        data_chunk.indices[empty_offset].write(idx);
-                        meta.bitmap |= 1 << empty_offset;
-                        meta.occupancy += 1;
-                    } else {
-                        overflow.push((chunk_id, std::mem::MaybeUninit::new(idx)));
-                        meta.occupancy += 1;
-                    }
-                }
-            } else {
-                data_chunk.indices[offset].write(idx);
-                meta.bitmap |= bit;
-                meta.occupancy += 1;
+        let mut min_key = u64::MAX;
+        let mut max_key = u64::MIN;
+        for idx in indices.iter() {
+            let k = idx.index as u64;
+            if k < min_key {
+                min_key = k;
+            }
+            if k > max_key {
+                max_key = k;
             }
         }
 
-        if overflow.len() > 1 {
-            sort_overflow(overflow);
+        if min_key == max_key {
+            return;
         }
 
-        let mut overflow_idx = 0;
+        let num_buckets = (n / 2048).next_power_of_two().clamp(16, 16384);
+        let bucket_mask = num_buckets - 1;
 
-        for id in 0..c {
-            let meta = metas[id];
-            if meta.occupancy == 0
-                && (overflow_idx >= overflow.len() || overflow[overflow_idx].0 != id)
-            {
+        let range = max_key - min_key;
+        let multiplier: u128 = ((num_buckets as u128) << 64) / ((range as u128) + 1);
+
+        ws.prepare(n, num_buckets);
+
+        // 1. Single-pass histogram
+        for idx in indices.iter() {
+            let diff = (idx.index as u64 - min_key) as u128;
+            let bucket = (((diff * multiplier) >> 64) as usize) & bucket_mask;
+            ws.counts[bucket] += 1;
+        }
+
+        // 2. Prefix sum
+        let mut sum = 0;
+        for (offset, &count) in ws.offsets.iter_mut().zip(&ws.counts) {
+            *offset = sum;
+            sum += count;
+        }
+
+        // 3. Disjoint single-pass scatter
+        let buf_ptr = ws.buffer.as_mut_ptr();
+        for &idx in indices.iter() {
+            let diff = (idx.index as u64 - min_key) as u128;
+            let bucket = (((diff * multiplier) >> 64) as usize) & bucket_mask;
+            let pos = ws.offsets[bucket];
+            unsafe {
+                buf_ptr.add(pos).write(MaybeUninit::new(idx));
+            }
+            ws.offsets[bucket] = pos + 1;
+        }
+
+        // 4. Local `arsort` per bucket and sequential write-back
+        let mut start = 0;
+        for &count in &ws.counts {
+            if count == 0 {
                 continue;
             }
+            let end = start + count;
 
-            let data_chunk = &chunks[id];
-            let mut bmp = meta.bitmap;
+            let bucket_slice: &mut [Index] =
+                unsafe { std::slice::from_raw_parts_mut(buf_ptr.add(start) as *mut Index, count) };
 
-            while bmp != 0 {
-                let offset = bmp.trailing_zeros() as usize;
-                let idx = unsafe { data_chunk.indices[offset].assume_init() };
-                ordered.push(idx);
-                bmp &= !(1 << offset);
+            if count > 1 {
+                arsort(bucket_slice);
             }
 
-            while overflow_idx < overflow.len() && overflow[overflow_idx].0 == id {
-                let idx = unsafe { overflow[overflow_idx].1.assume_init() };
-                ordered.push(idx);
-                overflow_idx += 1;
-            }
+            indices[start..end].copy_from_slice(bucket_slice);
+            start = end;
         }
     }
 
@@ -242,42 +204,8 @@ impl VerifiedIndices {
             return;
         }
 
-        let n = new_targets.len();
-        if n == 1 {
-            self.ordered.extend_from_slice(new_targets);
-            return;
-        }
-
-        let min_key = new_targets
-            .iter()
-            .map(|idx| idx.index as u64)
-            .min()
-            .unwrap();
-        let max_key = new_targets
-            .iter()
-            .map(|idx| idx.index as u64)
-            .max()
-            .unwrap();
-        let range = max_key.saturating_sub(min_key);
-
-        let c = std::cmp::max(1, n / 4);
-        let m = (c * 16 - 1) as u64;
-        let multiplier = if range == 0 {
-            0
-        } else {
-            (((m as u128) << 32) / (range as u128)) as u64
-        };
-
-        self.ws.prepare(c);
-
-        Self::build_from_indices(
-            new_targets,
-            c,
-            min_key,
-            multiplier,
-            &mut self.ws,
-            &mut self.ordered,
-        );
+        self.ordered.extend_from_slice(new_targets);
+        Self::build_from_indices(&mut self.ordered, &mut self.ws);
     }
 
     pub fn as_slice(&self) -> &[Index] {
@@ -295,9 +223,11 @@ pub struct OrdexIter<'a, T> {
     pos: usize,
 }
 
-impl<'a, T> OrdexIter<'a, T> {
+impl<'a, T: 'a> Iterator for OrdexIter<'a, T> {
+    type Item = &'a mut T;
+
     #[inline(always)]
-    pub fn next(&mut self) -> Option<&'a mut T> {
+    fn next(&mut self) -> Option<Self::Item> {
         if self.pos >= self.ordered.len() {
             return None;
         }
@@ -312,10 +242,24 @@ impl<'a, T> OrdexIter<'a, T> {
             }
         }
     }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.ordered.len() - self.pos;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T: 'a> ExactSizeIterator for OrdexIter<'a, T> {}
+
+impl<T> Default for OrdexArena<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> OrdexArena<T> {
-    pub(crate) const START_GENERATION: GenerationType = unsafe { GenerationType::new_unchecked(1) };
+    pub(crate) const START_GENERATION: GenerationType = GenerationType::new(1).unwrap();
 
     pub fn new() -> Self {
         Self {

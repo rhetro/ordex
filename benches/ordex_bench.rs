@@ -68,9 +68,9 @@ fn bench_alignment_comparison(c: &mut Criterion) {
     let verified = VerifiedIndices::new(indices.clone());
     c.bench_function("ordex_dynamic_16", |b| {
         b.iter(|| {
-            arena.ordex(&verified, |mut iter| {
+            arena.ordex(&verified, |iter| {
                 let mut sum = 0;
-                while let Some(val) = iter.next() {
+                for val in iter {
                     sum += *val;
                     *val = black_box(sum);
                 }
